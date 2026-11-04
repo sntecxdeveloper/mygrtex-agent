@@ -1,0 +1,30 @@
+[Unit]
+Description=MygrteX on-premises discovery agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=mygrtex-agent
+Group=mygrtex-agent
+EnvironmentFile=/etc/mygrtex-agent/agent.env
+ExecStart=/opt/mygrtex-agent/venv/bin/python /opt/mygrtex-agent/mygrtex_agent.py service
+Restart=always
+RestartSec=30
+NoNewPrivileges=true
+ProtectSystem=strict
+RuntimeDirectory=mygrtex-agent
+RuntimeDirectoryMode=0700
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=true
+CapabilityBoundingSet=
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
