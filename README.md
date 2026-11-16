@@ -1,6 +1,6 @@
 # MygrteX on-premises discovery agent
 
-A small Linux VM that you install **inside your network**. It reads the configuration of your VMware vCenter, Hyper-V hosts and physical Windows or Linux servers and
+A small Linux VM that you install **inside your network**. It reads the configuration of your VMware vCenter or standalone ESXi hosts, Hyper-V hosts and physical Windows or Linux servers and
 sends the inventory to your MygrteX portal, so the portal can assess the estate for migration to Azure.
 
 - **Read-only and metadata-only.** CPU, memory, disks, networks, operating system name and, optionally, utilization and established connections. No files, no application
@@ -25,6 +25,7 @@ This repository contains only the agent and its installer. It holds no secrets: 
 | DNS servers | 53/UDP+TCP | Name resolution |
 | NTP servers | 123/UDP | Correct time (TLS certificates are rejected if the clock is wrong) |
 | vCenter servers | 443/TCP | Only if you add a VMware target |
+| Standalone ESXi hosts | 443/TCP | Only if you add an ESXi target |
 | Hyper-V hosts, physical Windows servers | 5986/TCP (WinRM over HTTPS) | Only if you add those targets |
 | Physical Linux servers | 22/TCP (or the port you set) | Only if you add those targets (SSH) |
 
@@ -42,7 +43,7 @@ When it finishes, the agent is running and appears as **Online** in the portal w
 Manual alternative (the portal's command does exactly this):
 
 ```bash
-git clone --branch agent-v3.0.0 --depth 1 https://github.com/sntecxdeveloper/mygrtex-agent.git
+git clone --branch agent-v3.1.0 --depth 1 https://github.com/sntecxdeveloper/mygrtex-agent.git
 cd mygrtex-agent
 sudo MYGRTEX_AGENT_TOKEN='<token from the portal>' ./install.sh --server https://your-mygrtex.example.com --non-interactive
 ```
@@ -57,6 +58,7 @@ Open the agent in the portal and choose **Manage targets > Add target** for each
 | Target | What the agent connects to | Account |
 |---|---|---|
 | VMware vCenter | vCenter 7.0U2 or newer, REST API, GET only | the built-in **Read-only** role |
+| VMware ESXi (standalone, no vCenter) | vSphere SOAP API on port 443, read-only operations only (login, a VM list, logout) | a local ESXi user with the **Read-only** role |
 | Hyper-V hosts | WinRM over HTTPS, `Get-*` cmdlets from an allowlist | a dedicated account in **Hyper-V Administrators** (Hyper-V has no read-only role) |
 | Physical Windows servers | WinRM over HTTPS, `Get-CimInstance` of six fixed classes | **Remote Management Users** plus WMI read |
 | Physical Linux servers | SSH with a key, one fixed read-only script | an unprivileged user (no sudo), with an unencrypted key |

@@ -15,6 +15,7 @@ that target is being read, then deleted.
 
 Target types (set up in the portal, Discovery > On-premises agents > the agent > Targets):
   vmware   vCenter 7.0U2+ REST API; the built-in "Read-only" role is enough
+  esxi     standalone ESXi hosts (no vCenter) over the vSphere SOAP API on port 443; a local user with the "Read-only" role is enough
   hyperv   Hyper-V hosts over WinRM (needs `pip install pywinrm`); read-only Get-* cmdlets
   windows  physical Windows servers over WinRM; read-only Get-CimInstance queries
   linux    physical Linux servers over SSH with a key; a fixed read-only command set. A host's SSH key is approved in the portal after the agent reports its fingerprint.
@@ -52,11 +53,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-AGENT_VERSION = "3.0.0"
+AGENT_VERSION = "3.1.0"
 SCHEMA_VERSION = "2.0"
 CONFIG_DIR = Path(os.environ.get("MYGRTEX_AGENT_DIR", "/etc/mygrtex-agent"))
 RUN_DIR = Path(os.environ.get("MYGRTEX_AGENT_RUN_DIR", "/run/mygrtex-agent"))      # tmpfs created by systemd (RuntimeDirectory): temporary SSH keys live here, never on disk
-SOURCE_OF = {"vmware": "vmware", "hyperv": "hyperv", "windows": "physical", "linux": "physical"}
+SOURCE_OF = {"vmware": "vmware", "esxi": "vmware", "hyperv": "hyperv", "windows": "physical", "linux": "physical"}
 
 
 def _get(d: Any, *path: str, default: Any = None) -> Any:
@@ -210,6 +211,187 @@ def vsphere_fetcher(base: str, user: str, password: str, ca_file: str | None, ve
 
 class TargetError(Exception):
     """One target failed. The others are still collected; the reason is reported to MygrteX."""
+
+
+# ---------------------------------------------------------------- Standalone ESXi hosts (vSphere SOAP API at /sdk, read-only)
+# A standalone ESXi host has no /api/vcenter REST API: it serves the vSphere Web Services (SOAP) API only. The agent logs in, creates a session-scoped container view of the
+# virtual machines, reads their properties and logs out. Nothing is changed on the host. Only the operations in _SOAP_READ_ONLY can be sent (checked before every call).
+
+_SOAP_READ_ONLY = frozenset({"RetrieveServiceContent", "Login", "Logout", "CreateContainerView", "DestroyView", "RetrievePropertiesEx", "ContinueRetrievePropertiesEx"})
+_ESXI_PROPS = ["name", "runtime.powerState", "config.hardware.numCPU", "config.hardware.memoryMB", "config.firmware", "config.guestFullName", "config.hardware.device",
+               "guest.toolsRunningStatus", "guest.guestFullName", "guest.net"]
+_XSI_TYPE = "{http://www.w3.org/2001/XMLSchema-instance}type"
+
+
+def _soap_tree(el: Any) -> Any:
+    """An XML element as plain data: text for a leaf, else {tag: [children...]} (always lists), with "_type" holding xsi:type."""
+    kids = list(el)
+    if not kids:
+        return el.text or ""
+    out: dict[str, Any] = {}
+    for k in kids:
+        v = _soap_tree(k)
+        if isinstance(v, dict) and k.get(_XSI_TYPE):
+            v["_type"] = k.get(_XSI_TYPE).split(":")[-1]
+        out.setdefault(k.tag.rsplit("}", 1)[-1], []).append(v)
+    return out
+
+
+def _sl(d: Any, tag: str) -> list[Any]:
+    return d.get(tag, []) if isinstance(d, dict) else []
+
+
+def _s1(d: Any, *path: str, default: Any = "") -> Any:
+    for p in path:
+        k = _sl(d, p)
+        if not k:
+            return default
+        d = k[0]
+    return d
+
+
+def esxi_session(host: str, user: str, password: str, ca_file: str | None, verify: bool = True) -> tuple[Callable[[str, str], Any], Callable[[], None]]:
+    """(call, close) for one ESXi host. call(operation, inner_xml) returns the parsed <returnval>; only read-only operations are allowed."""
+    import xml.etree.ElementTree as ET
+    from xml.sax.saxutils import escape
+    ctx = ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname, ctx.verify_mode = False, ssl.CERT_NONE
+        print(f"warning: TLS certificate checking is OFF for ESXi host {host}", file=sys.stderr)
+    url = "https://" + (f"[{host}]" if ":" in host else host) + "/sdk"
+    state = {"cookie": ""}
+
+    def call(op: str, inner: str) -> Any:
+        if op not in _SOAP_READ_ONLY:
+            raise ValueError(f"SOAP operation not allowed (read-only operations only): {op}")
+        env = ('<?xml version="1.0" encoding="UTF-8"?><soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" '
+               f'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"><soapenv:Body><{op} xmlns="urn:vim25">{inner}</{op}></soapenv:Body></soapenv:Envelope>')
+        headers = {"Content-Type": "text/xml; charset=utf-8", "SOAPAction": "urn:vim25/6.7"}
+        if state["cookie"]:
+            headers["Cookie"] = state["cookie"]
+        req = urllib.request.Request(url, data=env.encode(), method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=60) as r:
+                raw, cookie = r.read(), r.headers.get("Set-Cookie") or ""
+        except urllib.error.HTTPError as e:                                  # a SOAP fault comes as HTTP 500 with the reason in the body
+            raw, cookie = e.read(), ""
+        except (urllib.error.URLError, OSError) as e:
+            raise TargetError(f"ESXi host {host} is not reachable: {getattr(e, 'reason', e)}")
+        m = re.search(r"vmware_soap_session=[^;,\s]+", cookie)
+        if m:
+            state["cookie"] = m.group(0)
+        if re.search(rb"<!DOCTYPE|<!ENTITY", raw, re.I):                     # no entity tricks in a response
+            raise TargetError(f"ESXi host {host} sent an unexpected response")
+        try:
+            body = _soap_tree(ET.fromstring(raw))
+        except ET.ParseError:
+            raise TargetError(f"ESXi host {host} did not return a vSphere API response (is this an ESXi host? port 443)")
+        body = _s1(body, "Body", default={})
+        fault = _s1(body, "Fault")
+        if fault:
+            msg = str(_s1(fault, "faultstring"))
+            if "InvalidLogin" in raw.decode("utf8", "replace") or "incorrect user name" in msg.lower():
+                raise TargetError(f"ESXi host {host} rejected the account")
+            raise TargetError(f"ESXi host {host}: {msg or 'request refused'}"[:200])
+        return _s1(body, f"{op}Response", "returnval", default="")
+
+    content = call("RetrieveServiceContent", '<_this type="ServiceInstance">ServiceInstance</_this>')
+    sm = escape(str(_s1(content, "sessionManager")))
+    call("Login", f'<_this type="SessionManager">{sm}</_this><userName>{escape(user)}</userName><password>{escape(password)}</password>')
+    call.content = content                                                    # type: ignore[attr-defined]
+
+    def close() -> None:
+        try:
+            call("Logout", f'<_this type="SessionManager">{sm}</_this>')
+        except Exception:
+            pass
+    return call, close
+
+
+def _esxi_power(s: str) -> str:
+    return {"poweredOn": "POWERED_ON", "poweredOff": "POWERED_OFF", "suspended": "SUSPENDED"}.get(s, s.upper())
+
+
+def map_esxi_vm(vm_id: str, p: dict[str, Any], location: str = "") -> tuple[list[dict[str, Any]], set[str]]:
+    """One ESXi VM (properties by path) to the same shape the vCenter mapping builds, so both sources are assessed identically."""
+    power = _esxi_power(str(p.get("runtime.powerState") or ""))
+    on = power == "POWERED_ON"
+    disks: dict[str, Any] = {}
+    for dev in _sl(p.get("config.hardware.device"), "VirtualDevice"):
+        if isinstance(dev, dict) and dev.get("_type") == "VirtualDisk":
+            cap = _s1(dev, "capacityInBytes") or (int(_s1(dev, "capacityInKB") or 0) * 1024 or "")
+            backing = _s1(dev, "backing", default={})
+            bt = backing.get("_type", "") if isinstance(backing, dict) else ""
+            disks[str(_s1(dev, "key"))] = {"label": str(_s1(dev, "deviceInfo", "label")), "capacity": int(cap) if cap else None,
+                                           "backing": {"type": "RAW_DISK" if "RawDisk" in bt else "VMDK_FILE" if bt else None}}
+    fw = str(p.get("config.firmware") or "")
+    detail: dict[str, Any] = {"cpu": {"count": int(p["config.hardware.numCPU"]) if p.get("config.hardware.numCPU") else None},
+                              "memory": {"size_MiB": int(p["config.hardware.memoryMB"]) if p.get("config.hardware.memoryMB") else None},
+                              "boot": {"type": "EFI" if fw == "efi" else "BIOS"} if fw else {}, "disks": disks, "guest_OS": ""}
+    tools = {"run_state": "RUNNING" if p.get("guest.toolsRunningStatus") == "guestToolsRunning" else "NOT_RUNNING"} if on else None
+    full = str(p.get("guest.guestFullName") or p.get("config.guestFullName") or "")
+    interfaces = None
+    if tools and tools["run_state"] == "RUNNING":
+        interfaces = [{"ip": {"ip_addresses": [{"ip_address": str(_s1(a, "ipAddress")), "prefix_length": int(_s1(a, "prefixLength") or 0) or None}
+                                               for a in _sl(_s1(nic, "ipConfig", default={}), "ipAddress")]}} for nic in _sl(p.get("guest.net"), "GuestNicInfo")]
+    summary = {"name": p.get("name") or vm_id, "power_state": power}
+    return map_vsphere_vm(vm_id, summary, detail, {"full_name": full} if full else None, tools, interfaces, location)
+
+
+def collect_esxi(hosts: list[str], session_for: Callable[[str], tuple[Callable[[str, str], Any], Callable[[], None]]], include_powered_off: bool = True,
+                 progress: Callable[[str], None] = lambda s: None) -> tuple[list[dict[str, Any]], list[str]]:
+    """Reads every standalone ESXi host. A host that fails is reported and the rest still go; all failing is a target error."""
+    from xml.sax.saxutils import escape
+    warnings = ["utilization history is not collected from ESXi: the platform sizes VMs from their configured CPU and memory",
+                "subnets are derived from guest IP addresses (VMware Tools must be running); an ESXi host does not store network address ranges",
+                "standalone ESXi hosts: no cluster, vMotion or HA information, and a VM that moves between hosts is reported once per host that has it registered"]
+    res: list[dict[str, Any]] = []
+    cidrs: set[str] = set()
+    failed: list[str] = []
+    for h in hosts:
+        try:
+            call, close = session_for(h)
+        except TargetError as e:
+            warnings.append(str(e))
+            failed.append(h)
+            continue
+        try:
+            c = getattr(call, "content", None) or {}
+            view = call("CreateContainerView", f'<_this type="ViewManager">{escape(str(_s1(c, "viewManager")))}</_this><container type="Folder">{escape(str(_s1(c, "rootFolder")))}</container>'
+                                               '<type>VirtualMachine</type><recursive>true</recursive>')
+            pc = escape(str(_s1(c, "propertyCollector")))
+            spec = ("<specSet><propSet><type>VirtualMachine</type>" + "".join(f"<pathSet>{x}</pathSet>" for x in _ESXI_PROPS) + "</propSet>"
+                    f'<objectSet><obj type="ContainerView">{escape(str(view))}</obj><skip>true</skip><selectSet xsi:type="TraversalSpec"><name>traverseView</name>'
+                    "<type>ContainerView</type><path>view</path><skip>false</skip></selectSet></objectSet></specSet><options><maxObjects>50</maxObjects></options>")
+            page = call("RetrievePropertiesEx", f'<_this type="PropertyCollector">{pc}</_this>{spec}')
+            n = 0
+            while isinstance(page, dict):
+                for o in _sl(page, "objects"):
+                    props = {str(_s1(ps, "name")): (_s1(ps, "val", default="")) for ps in _sl(o, "propSet")}
+                    n += 1
+                    if not include_powered_off and props.get("runtime.powerState") != "poweredOn":
+                        continue
+                    progress(f"{h}: VM {n}")
+                    r, cs = map_esxi_vm(f"{h}/{_s1(o, 'obj')}", props, h)
+                    res += r
+                    cidrs |= cs
+                token = _s1(page, "token")
+                page = call("ContinueRetrievePropertiesEx", f'<_this type="PropertyCollector">{pc}</_this><token>{escape(str(token))}</token>') if token else None
+            try:
+                call("DestroyView", f'<_this type="ContainerView">{escape(str(view))}</_this>')
+            except Exception:
+                pass
+            if n == 0:
+                warnings.append(f"{h}: no virtual machines were returned: check the account's permissions")
+        except TargetError as e:
+            warnings.append(str(e))
+            failed.append(h)
+        finally:
+            close()
+    if failed and len(failed) == len(hosts):
+        raise TargetError("; ".join(w for w in warnings if w.startswith("ESXi host"))[:300] or "no ESXi host could be read")
+    res += [subnet_resource(c, "") for c in sorted(cidrs)]
+    return res, warnings
 
 
 # ---------------------------------------------------------------- Windows over WinRM (Hyper-V and physical): read-only allowlist
@@ -707,6 +889,10 @@ def collect_target(t: dict[str, Any], policy: dict[str, Any], progress: Callable
     hosts = [h.strip() for h in t.get("hosts", []) if h.strip()]
     if not hosts:
         raise TargetError(f"target {t.get('name')}: no hosts")
+    if typ == "esxi":
+        pw = secret(t, "password")
+        res, w = collect_esxi(hosts, lambda h: esxi_session(h, t["user"], pw, t.get("ca_file") or None, bool(t.get("verify_tls", True))), inc, progress)
+        return "vmware", res, w
     if typ in ("hyperv", "windows"):
         pw = secret(t, "password")
         runner = lambda h: winrm_runner(h, t["user"], pw, t.get("transport", "ntlm"), bool(t.get("https", True)), bool(t.get("verify_tls", True)))  # noqa: E731
